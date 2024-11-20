@@ -21,7 +21,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 
+#include <linux/joystick.h>
 #include <X11/X.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/sync.h>
@@ -184,124 +186,164 @@ main(int argc, char *argv[])
 			errx(1, "no idle counter");
 	}
 
-	for (;;) {
-		cookie = &e.xcookie;
-		XNextEvent(dpy, &e);
+	fd_set in_fds;
+	struct timeval tv;
+	int x11_fd = ConnectionNumber(dpy);
+	int js_fd = open("/dev/input/js0", O_RDONLY);
+	struct js_event je;
 
-		int etype = e.type;
-		if (e.type == motion_type)
-			etype = MotionNotify;
-		else if (e.type == key_press_type ||
-		    e.type == key_release_type)
-			etype = KeyRelease;
-		else if (e.type == button_press_type ||
-		    e.type == button_release_type)
-			etype = ButtonRelease;
-		else if (e.type == device_change_type) {
-			XDevicePresenceNotifyEvent *xdpe =
-			    (XDevicePresenceNotifyEvent *)&e;
-			if (last_device_change == xdpe->serial)
-				continue;
-			snoop_root();
-			last_device_change = xdpe->serial;
-			continue;
+	if (js_fd != -1)
+		DPRINTF(("attaching to controller\n"));
+
+	for (;;) {
+		FD_ZERO(&in_fds);
+		FD_SET(x11_fd, &in_fds);
+		FD_SET(js_fd, &in_fds);
+		tv.tv_usec = 0;
+		tv.tv_sec = 1;
+
+		// Wait for X Event, Joystick or a Timer
+		int max_fd = (x11_fd > js_fd) ? x11_fd : js_fd;
+		int num_ready_fds = select(max_fd + 1, &in_fds, NULL, NULL, &tv);
+		if (num_ready_fds < 0)
+			errx(1, "failed reading socket");
+		else if (num_ready_fds == 0) {
+			if (js_fd == -1 && access("/dev/input/js0", R_OK) != -1) {
+				js_fd = open("/dev/input/js0", O_RDONLY);
+				DPRINTF(("attaching to controller\n"));
+			}
+		};
+
+		if (FD_ISSET(js_fd, &in_fds)) {
+			if (read (js_fd, &je, sizeof(je)) == -1) {
+				close(js_fd);
+				js_fd = -1;
+				DPRINTF(("disconnected controller\n"));
+			}
+			if (!(je.type & JS_EVENT_INIT) && je.value != 0) {
+				hide_cursor();
+			}
 		}
 
-		switch (etype) {
-		case KeyRelease:
-			if (ignored) {
-				unsigned int state = 0;
+		cookie = &e.xcookie;
+		while(XPending(dpy)) {
+			XNextEvent(dpy, &e);
 
-				/* masks are only set on key release, if
-				 * ignore is set we must throw out non-release
-				 * events here */
-				if (e.type == key_press_type) {
-					break;
-				}
-
-				/* extract modifier state */
-				if (e.type == key_release_type) {
-					/* xinput device event */
-					XDeviceKeyEvent *key =
-					    (XDeviceKeyEvent *) &e;
-					state = key->state;
-				} else if (e.type == KeyRelease) {
-					/* legacy event */
-					state = e.xkey.state;
-				}
-
-				if (state & ignored) {
-					DPRINTF(("ignoring key %d\n", state));
-					break;
-				}
+			int etype = e.type;
+			if (e.type == motion_type)
+				etype = MotionNotify;
+			else if (e.type == key_press_type ||
+				e.type == key_release_type)
+				etype = KeyRelease;
+			else if (e.type == button_press_type ||
+				e.type == button_release_type)
+				etype = ButtonRelease;
+			else if (e.type == device_change_type) {
+				XDevicePresenceNotifyEvent *xdpe =
+					(XDevicePresenceNotifyEvent *)&e;
+				if (last_device_change == xdpe->serial)
+					continue;
+				snoop_root();
+				last_device_change = xdpe->serial;
+				continue;
 			}
 
-			hide_cursor();
-			break;
+			switch (etype) {
+			case KeyRelease:
+				if (ignored) {
+					unsigned int state = 0;
 
-		case ButtonRelease:
-		case MotionNotify:
-			if (!always_hide)
-				show_cursor();
-			break;
+					/* masks are only set on key release, if
+					 * ignore is set we must throw out non-release
+					 * events here */
+					if (e.type == key_press_type) {
+						break;
+					}
 
-		case CreateNotify:
-			if (legacy) {
-				DPRINTF(("new window, snooping on it\n"));
+					/* extract modifier state */
+					if (e.type == key_release_type) {
+						/* xinput device event */
+						XDeviceKeyEvent *key =
+							(XDeviceKeyEvent *) &e;
+						state = key->state;
+					} else if (e.type == KeyRelease) {
+						/* legacy event */
+						state = e.xkey.state;
+					}
 
-				/* not sure why snooping directly on the window
-				 * doesn't work, so snoop on all windows from
-				 * its parent (probably root) */
-				snoop_legacy(e.xcreatewindow.parent);
-			}
-			break;
+					if (state & ignored) {
+						DPRINTF(("ignoring key %d\n", state));
+						break;
+					}
+				}
 
-		case GenericEvent:
-			/* xi2 raw event */
-			XGetEventData(dpy, cookie);
-			XIDeviceEvent *xie = (XIDeviceEvent *)cookie->data;
+				hide_cursor();
+				break;
 
-			switch (xie->evtype) {
-			case XI_RawMotion:
-			case XI_RawButtonPress:
-				if (ignore_scroll && ((xie->detail >= 4 && xie->detail <= 7) ||
-						xie->event_x == xie->event_y))
-					break;
+			case ButtonRelease:
+			case MotionNotify:
 				if (!always_hide)
 					show_cursor();
 				break;
 
-			case XI_RawButtonRelease:
+			case CreateNotify:
+				if (legacy) {
+					DPRINTF(("new window, snooping on it\n"));
+
+					/* not sure why snooping directly on the window
+					 * doesn't work, so snoop on all windows from
+					 * its parent (probably root) */
+					snoop_legacy(e.xcreatewindow.parent);
+				}
 				break;
 
-			case XI_RawTouchBegin:
-			case XI_RawTouchEnd:
-			case XI_RawTouchUpdate:
-				if (!keep_touch_cursor)
-					hide_cursor();
+			case GenericEvent:
+				/* xi2 raw event */
+				XGetEventData(dpy, cookie);
+				XIDeviceEvent *xie = (XIDeviceEvent *)cookie->data;
+
+				switch (xie->evtype) {
+				case XI_RawMotion:
+				case XI_RawButtonPress:
+					if (ignore_scroll && ((xie->detail >= 4 && xie->detail <= 7) ||
+							xie->event_x == xie->event_y))
+						break;
+					if (!always_hide)
+						show_cursor();
+					break;
+
+				case XI_RawButtonRelease:
+					break;
+
+				case XI_RawTouchBegin:
+				case XI_RawTouchEnd:
+				case XI_RawTouchUpdate:
+					if (!keep_touch_cursor)
+						hide_cursor();
+					break;
+
+				default:
+					DPRINTF(("unknown XI event type %d\n",
+						xie->evtype));
+				}
+
+				XFreeEventData(dpy, cookie);
 				break;
 
 			default:
-				DPRINTF(("unknown XI event type %d\n",
-				    xie->evtype));
-			}
+				if (!timeout ||
+					e.type != (sync_event + XSyncAlarmNotify)) {
+					DPRINTF(("unknown event type %d\n", e.type));
+					break;
+				}
 
-			XFreeEventData(dpy, cookie);
-			break;
-
-		default:
-			if (!timeout ||
-			    e.type != (sync_event + XSyncAlarmNotify)) {
-				DPRINTF(("unknown event type %d\n", e.type));
-				break;
-			}
-
-			alarm_e = (XSyncAlarmNotifyEvent *)&e;
-			if (alarm_e->alarm == idle_alarm) {
-				DPRINTF(("idle counter reached %dms, hiding "
-				    "cursor\n",
-				    XSyncValueLow32(alarm_e->counter_value)));
-				hide_cursor();
+				alarm_e = (XSyncAlarmNotifyEvent *)&e;
+				if (alarm_e->alarm == idle_alarm) {
+					DPRINTF(("idle counter reached %dms, hiding "
+						"cursor\n",
+						XSyncValueLow32(alarm_e->counter_value)));
+					hide_cursor();
+				}
 			}
 		}
 	}
